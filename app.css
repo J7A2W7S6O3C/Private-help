@@ -150,3 +150,7 @@ ul.list .s { font-size: 14px; color: var(--muted); word-break: break-word; }
 .tips li { margin: 6px 0; }
 .empty { text-align: center; color: var(--muted); padding: 10px; }
 details summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
+
+body.locked #tabs { display: none; }
+body.veil #top, body.veil #view, body.veil #sheet { visibility: hidden; }
+button:disabled { opacity: .6; }

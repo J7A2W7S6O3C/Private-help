@@ -14,7 +14,7 @@ const daysUntil = (k) => Math.round((parseDay(k) - parseDay(dkey())) / 864e5);
 
 /* ---------- state ---------- */
 
-const CATS = [['delivery', 'Food delivery'], ['groceries', 'Groceries'], ['eatout', 'Eating out'], ['transport', 'Transport'], ['fun', 'Fun/games'], ['shopping', 'Shopping'], ['uni', 'Uni'], ['other', 'Other']];
+const CATS = [['delivery', 'Food delivery'], ['groceries', 'Groceries'], ['eatout', 'Eating out'], ['transport', 'Transport'], ['fun', 'Fun/games'], ['shopping', 'Shopping'], ['uni', 'Study'], ['other', 'Other']];
 
 function seed() {
   return {
@@ -83,12 +83,92 @@ function normTimer(t) {
   return { start: num(t.start), end: num(t.end), mins: num(t.mins), label: str(t.label), kind: t.kind === 'urge' ? 'urge' : 'focus', taskId: ID.test(String(t.taskId)) ? String(t.taskId) : null, beeped: !!t.beeped, urge: Object.hasOwn(URGE_KINDS, t.urge) ? t.urge : undefined };
 }
 
-let S;
-try { const raw = localStorage.getItem(KEY); S = raw ? normalize(JSON.parse(raw)) : seed(); } catch { S = seed(); }
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* storage full or blocked */ } };
+/* ---------- storage & optional app lock ----------
+   Without a passcode, data is saved as JSON in this device's localStorage.
+   With a passcode, it is encrypted on the device (AES-256-GCM, key derived
+   from the passcode with PBKDF2) before every write. The key only exists in
+   memory while the app is unlocked and is never written anywhere. */
 
-const ui = { tab: 'now', sheet: null, draftFor: null, showDone: false };
+const LOCK = { key: null, salt: null, locked: false, hiddenAt: 0, fails: 0 };
+const AUTO_LOCK_MS = 60 * 1000;
+const KDF_ITERATIONS = 600000;
+const te = new TextEncoder();
+const td = new TextDecoder();
+const cryptoOk = !!(window.crypto && crypto.subtle && window.isSecureContext);
+function b64(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s); }
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const isSealed = (d) => !!(d && d.anchorEncrypted === 1 && typeof d.ct === 'string' && typeof d.iv === 'string' && typeof d.salt === 'string');
+
+async function deriveKey(pass, salt) {
+  const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: KDF_ITERATIONS, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function seal(json, key, salt) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, te.encode(json)));
+  return { anchorEncrypted: 1, kdf: `PBKDF2-SHA256-${KDF_ITERATIONS}`, salt: b64(salt), iv: b64(iv), ct: b64(ct) };
+}
+async function unseal(env, pass) {
+  const salt = unb64(env.salt);
+  const key = await deriveKey(pass, salt);
+  // Throws if the passcode is wrong (GCM authentication fails).
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(env.iv) }, key, unb64(env.ct));
+  return { data: JSON.parse(td.decode(pt)), key, salt };
+}
+
+let S = null;
+(() => {
+  let raw = null;
+  try { raw = localStorage.getItem(KEY); } catch {}
+  try {
+    const d = raw ? JSON.parse(raw) : null;
+    if (isSealed(d)) LOCK.locked = true;
+    else S = d ? normalize(d) : seed();
+  } catch {
+    // Unreadable data: keep a copy rather than silently overwriting it.
+    try { localStorage.setItem(`${KEY}.unreadable`, raw); } catch {}
+    S = seed();
+  }
+})();
+
+let writeQueue = Promise.resolve();
+const store = (str) => { try { localStorage.setItem(KEY, str); } catch { /* storage full or blocked */ } };
+function save() {
+  if (!S) return;
+  const { key, salt } = LOCK;
+  const json = JSON.stringify(S);
+  // Writes are queued so an older write can never land after a newer one.
+  writeQueue = writeQueue.then(async () => store(key ? JSON.stringify(await seal(json, key, salt)) : json)).catch(() => {});
+}
+
+function lockNow() {
+  if (!LOCK.key) return;
+  S = null; LOCK.key = null; LOCK.locked = true;
+  ui.sheet = null; ui.draftFor = null; ui.pendingImport = null;
+  render();
+}
+
+async function unlock(pass) {
+  await writeQueue;
+  let env = null;
+  try { env = JSON.parse(localStorage.getItem(KEY)); } catch {}
+  if (!isSealed(env)) { S = env ? normalize(env) : seed(); LOCK.locked = false; return true; }
+  try {
+    const r = await unseal(env, pass);
+    S = normalize(r.data); LOCK.key = r.key; LOCK.salt = r.salt; LOCK.locked = false; LOCK.fails = 0;
+    return true;
+  } catch { LOCK.fails++; return false; }
+}
+
+function wipe() {
+  try { localStorage.removeItem(KEY); } catch {}
+  LOCK.key = null; LOCK.salt = null; LOCK.locked = false; LOCK.fails = 0;
+  S = seed();
+}
+
+const ui = { tab: 'now', sheet: null, draftFor: null, showDone: false, pendingImport: null };
 try { ui.tab = sessionStorage.getItem('anchor.tab') || 'now'; } catch {}
+if (!['now', 'plan', 'money', 'due', 'me'].includes(ui.tab)) ui.tab = 'now';
 
 const money = (n) => `${esc(S.settings.currency)}${(Math.round(n * 100) / 100).toFixed(2).replace(/\.00$/, '')}`;
 
@@ -149,7 +229,7 @@ function viewNow() {
   const today = S.tasks.filter((t) => t.list === 'today' && !t.done);
   const one = today[0];
   const b = bedtimeInfo();
-  let h = timerCard();
+  let h = installHint() + timerCard();
 
   if (b.late || b.soon) h += shutdownCard(b);
 
@@ -186,6 +266,16 @@ function viewNow() {
   return h;
 }
 
+function installHint() {
+  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  let hidden = false;
+  try { hidden = localStorage.getItem('anchor.hideInstall') === '1'; } catch {}
+  if (standalone || hidden) return '';
+  return `<div class="card warn"><b>Install this app</b><br><small>In Safari tap <b>Share → Add to Home Screen</b>, then always open it from that icon.
+    In an ordinary browser tab, iOS may clear the app’s data after about a week of not using it.</small>
+    <div class="row" style="margin-top:8px"><button class="sm" data-act="hide-install">Got it</button></div></div>`;
+}
+
 function alerts() {
   const out = [];
   const dl = S.deadlines.filter((d) => !d.done).sort((a, b) => a.due.localeCompare(b.due));
@@ -193,7 +283,7 @@ function alerts() {
     const n = daysUntil(d.due);
     if (n > 7) break;
     const cls = n <= 2 ? 'bad' : 'warn';
-    out.push(`<div class="card ${cls}" data-act="tab" data-id="uni"><div class="spread"><div class="t"><b>${esc(d.title)}</b></div><span class="pill ${cls}">${dueTxt(n)}</span></div>
+    out.push(`<div class="card ${cls}" data-act="tab" data-id="due"><div class="spread"><div class="t"><b>${esc(d.title)}</b></div><span class="pill ${cls}">${dueTxt(n)}</span></div>
       <small>${d.progress || 0}% done${d.next ? ` · next: ${esc(d.next)}` : ' · no next step yet'}</small></div>`);
   }
   const mk = mkey();
@@ -207,7 +297,7 @@ function alerts() {
   for (const p of S.promises) {
     if (p.done || !p.by) continue;
     const n = daysUntil(p.by);
-    if (n <= 1) out.push(`<div class="card ${n < 0 ? 'bad' : 'warn'}" data-act="tab" data-id="uni"><div class="spread"><b>Promised ${esc(p.who)}: ${esc(p.what)}</b>
+    if (n <= 1) out.push(`<div class="card ${n < 0 ? 'bad' : 'warn'}" data-act="tab" data-id="due"><div class="spread"><b>Promised ${esc(p.who)}: ${esc(p.what)}</b>
       <span class="pill ${n < 0 ? 'bad' : 'warn'}">${dueTxt(n)}</span></div><small>If you can’t make it, tell them now — honestly. Tap for a message draft.</small></div>`);
   }
   const stale = S.tasks.filter((t) => !t.done && t.list === 'today' && Date.now() - t.created > 3 * 864e5);
@@ -315,7 +405,7 @@ function viewMoney() {
 }
 const ord = (n) => (n % 10 === 1 && n !== 11 ? 'st' : n % 10 === 2 && n !== 12 ? 'nd' : n % 10 === 3 && n !== 13 ? 'rd' : 'th');
 
-function viewUni() {
+function viewDue() {
   const dl = S.deadlines.filter((d) => !d.done).sort((a, b) => a.due.localeCompare(b.due));
   let h = `<h2>Deadlines</h2><div class="card">${dl.length ? `<ul class="list">${dl.map((d) => {
     const n = daysUntil(d.due);
@@ -337,14 +427,14 @@ function viewUni() {
     <button class="primary big" style="margin-top:8px">Add deadline</button></form>`;
 
   const pr = S.promises.filter((p) => !p.done).sort((a, b) => (a.by || '9').localeCompare(b.by || '9'));
-  h += `<h2>Things I told someone I’d do</h2>
-  <p class="muted" style="margin:0 4px 8px;font-size:14px">Writing these down stops the “I’ll just say it’s nearly done” spiral. If you’re going to miss one, an early honest message costs far less than a cover story you then have to keep up.</p>
+  h += `<h2>Commitments</h2>
+  <p class="muted" style="margin:0 4px 8px;font-size:14px">Things you’ve said you’ll do for someone, so they don’t slip. Running late? An early heads-up is always easier than a late apology.</p>
   <div class="card">${pr.length ? `<ul class="list">${pr.map((p) => {
     const n = p.by ? daysUntil(p.by) : null;
     return `<li><button class="check" data-act="pr-done" data-id="${p.id}" aria-label="done"></button><div class="grow">
       <div class="spread"><div class="t">${esc(p.what)}</div>${n !== null ? `<span class="pill ${n < 0 ? 'bad' : n <= 1 ? 'warn' : ''}">${dueTxt(n)}</span>` : ''}</div>
       <div class="s">for ${esc(p.who)}</div>
-      ${ui.draftFor === p.id ? draftBox(p) : `<button class="sm" style="margin-top:6px" data-act="pr-draft" data-id="${p.id}">I’m going to be late — help me say it</button>`}
+      ${ui.draftFor === p.id ? draftBox(p) : `<button class="sm" style="margin-top:6px" data-act="pr-draft" data-id="${p.id}">Running late? Draft a heads-up</button>`}
       </div><button class="icon" data-act="pr-del" data-id="${p.id}" aria-label="delete">✕</button></li>`;
   }).join('')}</ul>` : '<div class="empty">Nothing tracked.</div>'}</div>
   <form class="card" data-form="promise"><div class="row"><input name="who" placeholder="Who" required autocomplete="off" style="max-width:120px"><input name="what" placeholder="What I said I’d do" required autocomplete="off"></div>
@@ -388,7 +478,15 @@ function viewMe() {
     <div class="row"><label class="field grow">Weekly spending budget<input name="weeklyBudget" inputmode="decimal" value="${esc(S.settings.weeklyBudget)}"></label>
     <label class="field" style="max-width:90px">Currency<input name="currency" value="${esc(S.settings.currency)}" maxlength="3"></label></div>
     <button class="primary big">Save settings</button></form>
-    <h2>Backup</h2><div class="card"><p class="muted" style="font-size:14px">Your data only lives on this phone. Export a backup now and then (it saves to Files).</p>
+    <h2>Privacy &amp; app lock</h2><div class="card">
+    <p style="font-size:14px">Everything stays on this device: no account, no server, no tracking. The app is blocked from contacting any other website.</p>
+    ${!cryptoOk ? '<p class="muted" style="font-size:14px">App lock needs the app to be opened over https.</p>'
+      : LOCK.key ? `<p style="font-size:14px"><b>App lock is on.</b> Your data is encrypted on this device and the app locks itself a minute after you leave it.</p>
+        <div class="row wrap"><button class="primary" data-act="lock-now">Lock now</button><button class="ghost" data-act="lock-off">Turn off app lock</button></div>`
+      : `<p class="muted" style="font-size:14px">App lock is off. Anyone who opens this app on your unlocked phone can read it. A passcode encrypts everything the app saves.</p>
+        <button class="primary" data-act="lock-setup">Set a passcode</button>`}</div>
+    <h2>Backup</h2><div class="card"><p class="muted" style="font-size:14px">Your data only exists on this device. Export a backup now and then, and pick <b>Save to Files</b>.
+      ${LOCK.key ? 'Backups are encrypted with your passcode.' : '<b>Backups are not encrypted</b> while app lock is off.'} Never upload a backup anywhere public.</p>
     <div class="row wrap"><button data-act="export">Export backup</button><button data-act="import">Import backup</button><button class="danger ghost" data-act="reset">Erase everything</button></div></div>`;
   return h;
 }
@@ -407,6 +505,23 @@ const URGES = {
 function sheetHtml() {
   const s = ui.sheet;
   if (!s) return '';
+  if (s.step === 'lock-setup') {
+    return `<div class="panel"><h3>Set a passcode</h3>
+      <p class="muted">Everything this app saves will be encrypted on this device. It locks itself a minute after you leave it.</p>
+      <p><b>If you forget the passcode, your data can’t be recovered.</b> Export a backup first if you want a safety net. Use at least 6 characters; longer is stronger.</p>
+      <form data-form="lockSetup" autocomplete="off">
+        <input name="p1" type="password" autocomplete="new-password" placeholder="Passcode" required minlength="6">
+        <input name="p2" type="password" autocomplete="new-password" placeholder="Type it again" required minlength="6" style="margin-top:8px">
+        <button class="primary big" style="margin-top:10px">Turn on app lock</button></form>
+      <button class="ghost big" data-act="sheet-close" style="margin-top:8px">Cancel</button></div>`;
+  }
+  if (s.step === 'import-pass') {
+    return `<div class="panel"><h3>Encrypted backup</h3>
+      <p class="muted">Enter the passcode that was set when this backup was made. Restoring replaces everything currently in the app.</p>
+      <form data-form="importPass" autocomplete="off"><input name="pass" type="password" autocomplete="off" placeholder="Backup passcode" required>
+        <button class="primary big" style="margin-top:10px">Restore</button></form>
+      <button class="ghost big" data-act="sheet-close" style="margin-top:8px">Cancel</button></div>`;
+  }
   if (s.step === 'pick') {
     return `<div class="panel"><h3>What’s the urge?</h3><p class="muted">Naming it is the first win. You’re allowed to do it after — just not on autopilot.</p>
       <div class="chips">${Object.entries(URGES).map(([k, u]) => `<button class="chip" data-act="urge-kind" data-id="${k}">${u.name}</button>`).join('')}</div>
@@ -423,9 +538,27 @@ function sheetHtml() {
 
 /* ---------- render ---------- */
 
-const VIEWS = { now: viewNow, plan: viewPlan, money: viewMoney, uni: viewUni, me: viewMe };
+const VIEWS = { now: viewNow, plan: viewPlan, money: viewMoney, due: viewDue, me: viewMe };
+
+function lockScreen() {
+  return `<form class="card hero" data-form="unlock" autocomplete="off" style="margin-top:18vh">
+      <div class="label">Locked</div><div class="title">Enter your passcode</div>
+      <input name="pass" type="password" autocomplete="current-password" enterkeyhint="go" required>
+      <p id="lockMsg" class="muted">Your data is encrypted on this device.</p>
+      <button class="primary big">Unlock</button></form>
+    <details class="card"><summary>Forgot it?</summary>
+      <p class="muted">There’s no recovery. That’s what keeps it private. You can erase this app’s data and start again, then import a backup if you have one.</p>
+      <button class="danger" data-act="reset-locked">Erase and start over</button></details>`;
+}
 
 function render() {
+  document.body.classList.toggle('locked', LOCK.locked);
+  if (LOCK.locked) {
+    $('#top').innerHTML = '';
+    $('#view').innerHTML = lockScreen();
+    $('#sheet').innerHTML = ''; $('#sheet').hidden = true;
+    return;
+  }
   $('#top').innerHTML = header();
   $('#view').innerHTML = VIEWS[ui.tab]();
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.id === ui.tab));
@@ -473,6 +606,7 @@ function finishTimer() {
 }
 
 function tick() {
+  if (!S) return;
   const top = $('#top');
   if (top) top.innerHTML = header();
   const t = S.timer;
@@ -490,6 +624,13 @@ function tick() {
     const C = 2 * Math.PI * 42;
     arc.setAttribute('stroke-dashoffset', C * (1 - left / (t.mins * 60000)));
   }
+}
+
+function download(file) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file); a.download = file.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
 /* ---------- actions ---------- */
@@ -542,7 +683,7 @@ const ACTIONS = {
       if (amt > 0) S.spends.push({ id: uid(), amt, cat: kind === 'food' ? 'delivery' : 'shopping', note: '', ts: Date.now() });
     }
   },
-  'sheet-close': () => { ui.sheet = null; },
+  'sheet-close': () => { ui.sheet = null; ui.pendingImport = null; },
   habit: (el) => { const k = dkey(); S.habitLog[k] = S.habitLog[k] || {}; S.habitLog[k][el.dataset.id] = !S.habitLog[k][el.dataset.id]; },
   'habit-del': (el) => { if (confirm('Remove this daily basic?')) S.habits = S.habits.filter((h) => h.id !== el.dataset.id); },
   shut: (el) => { const k = dkey(); S.shutdown[k] = S.shutdown[k] || {}; S.shutdown[k][el.dataset.id] = !S.shutdown[k][el.dataset.id]; },
@@ -567,23 +708,37 @@ const ACTIONS = {
     return 'norender';
   },
   export: () => {
-    const blob = new Blob([JSON.stringify(S, null, 1)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = `anchor-backup-${dkey()}.json`;
-    document.body.appendChild(a); a.click(); a.remove();
+    // Built synchronously so the iOS share sheet still counts as a response to the tap.
+    let str = JSON.stringify(S);
+    if (LOCK.key) {
+      str = localStorage.getItem(KEY);
+      let ok = false;
+      try { ok = isSealed(JSON.parse(str)); } catch {}
+      if (!ok) { alert('Still encrypting, try again in a second.'); return 'norender'; }
+    }
+    const file = new File([str], `anchor-backup-${dkey()}.json`, { type: 'application/json' });
+    if (navigator.canShare?.({ files: [file] })) {
+      navigator.share({ files: [file] }).catch((err) => { if (err.name !== 'AbortError') download(file); });
+    } else download(file);
     return 'norender';
   },
   import: () => { $('#importFile').click(); return 'norender'; },
-  reset: () => { if (confirm('Erase ALL data on this phone? Export a backup first if unsure.') && confirm('Really erase everything?')) S = seed(); },
+  reset: () => { if (confirm('Erase ALL data in this app? Export a backup first if unsure.') && confirm('Really erase everything? This also turns off app lock.')) wipe(); },
+  'reset-locked': () => { if (confirm('Erase ALL data in this app? It can’t be undone.') && confirm('Really erase everything?')) wipe(); },
+  'lock-setup': () => { ui.sheet = { step: 'lock-setup' }; },
+  'lock-now': () => { lockNow(); return 'norender'; },
+  'lock-off': () => { if (confirm('Turn off app lock? Your data will be stored unencrypted on this device.')) { LOCK.key = null; LOCK.salt = null; } },
+  'hide-install': () => { try { localStorage.setItem('anchor.hideInstall', '1'); } catch {} },
 };
 
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) {
-    if (e.target.id === 'sheet') { ui.sheet = null; render(); }
+    if (e.target.id === 'sheet' && !LOCK.locked) { ui.sheet = null; ui.pendingImport = null; render(); }
     return;
   }
   e.preventDefault();
+  if (LOCK.locked && el.dataset.act !== 'reset-locked') return;
   const fn = ACTIONS[el.dataset.act];
   if (!fn) return;
   if (fn(el) === 'norender') return;
@@ -609,14 +764,49 @@ const FORMS = {
     S.settings = { ...S.settings, name: f.name.trim(), bedtime: f.bedtime || '23:30', weeklyBudget: parseFloat(f.weeklyBudget) || 0, currency: f.currency || '$' };
     alert('Saved.');
   },
+  unlock: async (f, form) => {
+    const btn = form.querySelector('button');
+    btn.disabled = true; btn.textContent = 'Checking…';
+    if (await unlock(f.pass || '')) return;
+    // Slow down repeated guesses.
+    const wait = LOCK.fails >= 3 ? Math.min(60, 2 ** (LOCK.fails - 2)) : 0;
+    $('#lockMsg').textContent = wait ? `Wrong passcode. Try again in ${wait}s.` : 'Wrong passcode.';
+    form.pass.value = '';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Unlock'; }, wait * 1000);
+    return 'norender';
+  },
+  lockSetup: async (f, form) => {
+    if ((f.p1 || '').length < 6) { alert('Use at least 6 characters.'); return 'norender'; }
+    if (f.p1 !== f.p2) { alert('Those didn’t match. Try again.'); form.reset(); return 'norender'; }
+    form.querySelector('button').textContent = 'Encrypting…';
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    LOCK.key = await deriveKey(f.p1, salt);
+    LOCK.salt = salt;
+    ui.sheet = null;
+  },
+  importPass: async (f, form) => {
+    form.querySelector('button').textContent = 'Decrypting…';
+    try {
+      const { data } = await unseal(ui.pendingImport, f.pass || '');
+      S = normalize(data);
+      ui.pendingImport = null; ui.sheet = null;
+    } catch {
+      alert('That passcode doesn’t open this backup.');
+      form.querySelector('button').textContent = 'Restore';
+      form.pass.value = '';
+      return 'norender';
+    }
+  },
 };
 
-document.addEventListener('submit', (e) => {
+document.addEventListener('submit', async (e) => {
   const form = e.target.closest('[data-form]');
   if (!form) return;
   e.preventDefault();
+  const name = form.dataset.form;
+  if (LOCK.locked !== (name === 'unlock')) return;
   const data = Object.fromEntries(new FormData(form).entries());
-  FORMS[form.dataset.form](data);
+  if ((await FORMS[name](data, form)) === 'norender') return;
   save();
   render();
 });
@@ -626,16 +816,34 @@ $('#importFile').addEventListener('change', async (e) => {
   if (!file) return;
   try {
     const data = JSON.parse(await file.text());
-    if (!data || !Array.isArray(data.tasks) || !data.settings) throw new Error('bad');
-    if (confirm('Replace everything on this phone with this backup?')) { S = normalize(data); save(); render(); }
+    if (isSealed(data)) {
+      if (!cryptoOk) throw new Error('no crypto');
+      ui.pendingImport = data; ui.sheet = { step: 'import-pass' }; render();
+    } else {
+      if (!data || !Array.isArray(data.tasks) || !data.settings) throw new Error('bad');
+      if (confirm('Replace everything in this app with this backup?')) { S = normalize(data); save(); render(); }
+    }
   } catch { alert('That file doesn’t look like an Anchor backup.'); }
   e.target.value = '';
 });
 
-document.addEventListener('visibilitychange', () => { if (!document.hidden) render(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    LOCK.hiddenAt = Date.now();
+    // Hide contents from the app switcher preview when app lock is on.
+    if (LOCK.key) document.body.classList.add('veil');
+    return;
+  }
+  document.body.classList.remove('veil');
+  if (LOCK.key && Date.now() - LOCK.hiddenAt > AUTO_LOCK_MS) lockNow();
+  else render();
+});
 
 render();
 setInterval(tick, 1000);
+
+// Ask iOS not to evict this app's storage (granted automatically for home-screen apps).
+navigator.storage?.persist?.().catch(() => {});
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});

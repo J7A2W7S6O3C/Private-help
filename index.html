@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Anchor">
+<meta name="theme-color" content="#101418">
+<title>Anchor</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="top"></header>
+<main id="view"></main>
+<div id="sheet" hidden></div>
+<nav id="tabs">
+  <button data-act="tab" data-id="now"><span>◉</span>Now</button>
+  <button data-act="tab" data-id="plan"><span>☰</span>Plan</button>
+  <button data-act="tab" data-id="money"><span>$</span>Money</button>
+  <button data-act="tab" data-id="uni"><span>✎</span>Uni</button>
+  <button data-act="tab" data-id="me"><span>✓</span>Me</button>
+</nav>
+<input type="file" id="importFile" accept="application/json,.json" hidden>
+<script src="app.js"></script>
+</body>
+</html>
